@@ -31,24 +31,30 @@ class BettingStrategy:
                 baseline.label_encoder = self.results_predictor.label_encoder
                 self.all_predictors[baseline.__class__.__name__] = baseline
 
-        # 如果启用CKFM评估，添加特殊标记
+        # 如果启用CKFM评估，添加CKFM策略
         if self.evaluate_ckfm:
-            self.all_predictors['CKFMValueBetting'] = 'special_ckfm'  # 特殊标记
+            # 创建CKFM策略实例
+            ckfm_strategy = predictions.CKFMValueBetting()
+            ckfm_strategy.label_encoder = self.results_predictor.label_encoder
+            self.all_predictors['CKFMValueBetting'] = ckfm_strategy
 
         self.total_bet_amount = {name: 0 for name in self.all_predictors}
         self.bankroll = {name: self.initial_bankroll for name in self.all_predictors}
         self.bankroll_over_time = {}
         self.ckfm_records = []
+        self.bet_records = {name: [] for name in self.all_predictors}  # 记录每个策略的投注
 
     def apply(self, dataset: pd.DataFrame, matches: pd.DataFrame, verbose=False):
         """应用投注策略"""
         for name, predictor in self.all_predictors.items():
-            if name == 'CKFMValueBetting' and predictor == 'special_ckfm':
-                # 特殊处理CKFM策略
-                self._apply_ckfm_strategy(dataset, matches, verbose)
+            current_data = dataset.copy()
+
+            # 对于CKFM策略，需要特殊处理
+            if name == 'CKFMValueBetting':
+                self._apply_ckfm_strategy(current_data, matches, verbose)
                 continue
 
-            current_data = dataset.copy()
+            # 其他策略的正常处理
             with_proba = (name == self.results_predictor.model_name) and self.do_value_betting
 
             # 只在主模型做缺失值填补
@@ -75,13 +81,84 @@ class BettingStrategy:
     def _apply_ckfm_strategy(self, dataset: pd.DataFrame, matches: pd.DataFrame, verbose=False):
         """专门处理CKFM投注策略"""
         name = 'CKFMValueBetting'
+
         try:
-            # 使用results_predictor的专门方法获取CKFM预测
-            ckfm_predictions = self.results_predictor.get_ckfm_predictions(dataset)
-            self._apply_betting_logic(name, ckfm_predictions, matches, with_proba=False, verbose=verbose)
+            # 获取主模型的概率预测
+            main_predictions = self.results_predictor.infer(dataset, with_proba=True)
+
+            # 检查赔率数据
+            odds_cols = [f"{self.betting_platform}{suffix}" for suffix in ['H', 'D', 'A']]
+
+            # 确保matches和dataset有相同的索引
+            for idx in dataset.index:
+                if idx not in matches.index:
+                    continue
+
+                match = matches.loc[idx]
+
+                # 检查赔率是否可用
+                if not all(col in match.index and pd.notna(match[col]) and match[col] > 1 for col in odds_cols):
+                    continue
+
+                # 如果没有足够资金，跳过
+                if self.bankroll[name] < self.stake_per_bet:
+                    continue
+
+                # 获取模型概率
+                model_probs = main_predictions.loc[idx, ['H', 'D', 'A']].values
+
+                # 计算市场概率
+                odds = [match[col] for col in odds_cols]
+                market_probs = np.array([1 / o for o in odds])
+                market_probs = market_probs / market_probs.sum()
+
+                # 计算CKFM
+                ckfm_scores = model_probs - market_probs
+
+                # 找出CKFM最高的选项
+                best_idx = np.argmax(ckfm_scores)
+                best_outcome = ['H', 'D', 'A'][best_idx]
+                best_ckfm = ckfm_scores[best_idx]
+                best_odds = odds[best_idx]
+
+                # CKFM策略：只在CKFM为正且超过阈值时下注
+                ckfm_threshold = 0.05  # 5%的优势
+                if best_ckfm > ckfm_threshold:
+                    # 进行投注
+                    self.total_bet_amount[name] += self.stake_per_bet
+                    self.bankroll[name] -= self.stake_per_bet
+
+                    # 检查投注结果
+                    actual_result = match.get('FTR')
+                    if actual_result == best_outcome:
+                        winnings = self.stake_per_bet * best_odds
+                        self.bankroll[name] += winnings
+                        profit = winnings - self.stake_per_bet
+                        if verbose:
+                            print(
+                                f"[CKFM] ✅ Win: {best_outcome} @ {best_odds:.2f} -> +${profit:.2f} (CKFM: {best_ckfm:.3f})")
+                    else:
+                        if verbose:
+                            print(f"[CKFM] ❌ Loss: Bet {best_outcome}, Result {actual_result} (CKFM: {best_ckfm:.3f})")
+
+                    # 记录投注信息
+                    self.bet_records[name].append({
+                        'match_idx': idx,
+                        'bet': best_outcome,
+                        'odds': best_odds,
+                        'ckfm': best_ckfm,
+                        'result': actual_result,
+                        'won': actual_result == best_outcome
+                    })
+
+                    # 记录CKFM分数
+                    self.ckfm_records.append(best_ckfm)
+
         except Exception as e:
             if verbose:
                 print(f"⚠️ CKFM策略失败: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _apply_betting_logic(self, predictor_name: str, predictions: pd.DataFrame,
                              matches: pd.DataFrame, with_proba: bool, verbose=False):
@@ -93,7 +170,7 @@ class BettingStrategy:
                         f"⚠️ Missing prediction for {predictor_name}: {match.get('HomeTeam')} vs {match.get('AwayTeam')}")
                 continue
 
-            bet_result = self._select_bet_result(predictions, idx, match, with_proba, predictor_name)
+            bet_result = self._select_bet_result(predictions, idx, match, with_proba, predictor_name, verbose)
             if bet_result is None or self.bankroll[predictor_name] < self.stake_per_bet:
                 continue
 
@@ -108,10 +185,16 @@ class BettingStrategy:
                 if pd.notna(odds) and odds > 1:
                     winnings = self.stake_per_bet * odds
                     self.bankroll[predictor_name] += winnings
-                    if verbose and predictor_name == 'CKFMValueBetting':
-                        print(f"✅ CKFM Win: {bet_result} @ {odds:.2f} -> +${winnings:.2f}")
 
-    def _select_bet_result(self, predictions: pd.DataFrame, idx, match, with_proba, predictor_name=None):
+            # 记录投注
+            self.bet_records[predictor_name].append({
+                'match_idx': idx,
+                'bet': bet_result,
+                'result': actual_result,
+                'won': actual_result == bet_result
+            })
+
+    def _select_bet_result(self, predictions: pd.DataFrame, idx, match, with_proba, predictor_name=None, verbose=False):
         """选择投注结果"""
         if not with_proba:
             return predictions.loc[idx, 'result']
@@ -126,42 +209,26 @@ class BettingStrategy:
             # 只考虑模型预测的最可能结果
             outcomes = [predictions.loc[idx, 'result']]
 
-        # 计算市场总概率用于归一化
-        total_market_inv = 0
-        for outcome in ['H', 'D', 'A']:
-            odds = match.get(f"{self.betting_platform}{outcome}", np.nan)
-            if pd.notna(odds) and odds > 1:
-                total_market_inv += 1 / odds
-
-        if total_market_inv == 0:
-            return None
-
         for outcome in outcomes:
             odds_key = f"{self.betting_platform}{outcome}"
             odds = match.get(odds_key, np.nan)
             if pd.isna(odds) or odds <= 1:
                 continue
 
-            market_prob = (1 / odds) / total_market_inv
             model_prob = predictions.loc[idx, outcome]
-            ckfm = model_prob - market_prob
             expected_value = model_prob * odds
 
             # 设置投注阈值
-            ckfm_threshold = 0.05
             ev_threshold = 1.0
 
             if self.do_value_betting:
-                # 价值投注：要求正期望值和足够的CKFM优势
-                if ckfm > ckfm_threshold and expected_value > ev_threshold and expected_value > best_value:
+                # 价值投注：要求正期望值
+                if expected_value > ev_threshold and expected_value > best_value:
                     selected_result = outcome
                     best_value = expected_value
 
-                    # 记录CKFM信息
-                    if self.evaluate_ckfm and predictor_name == self.results_predictor.model_name:
-                        self.ckfm_records.append(ckfm)
-                        print(
-                            f"[CKFM] ✅ Bet: {outcome} | CKFM: {ckfm:.3f} | EV: {expected_value:.3f} | Odds: {odds:.2f}")
+                    if verbose and predictor_name == self.results_predictor.model_name:
+                        print(f"[{predictor_name}] Value bet: {outcome} | EV: {expected_value:.3f} | Odds: {odds:.2f}")
             else:
                 # 非价值投注：直接选择最可能的结果
                 if expected_value > best_value:
@@ -190,6 +257,9 @@ class BettingStrategy:
         for name in self.all_predictors:
             profit = self.bankroll[name] - self.initial_bankroll
             roi = (profit / self.initial_bankroll) * 100 if self.initial_bankroll > 0 else 0
+            num_bets = len(self.bet_records[name])
+            wins = sum(1 for bet in self.bet_records[name] if bet['won'])
+            win_rate = (wins / num_bets * 100) if num_bets > 0 else 0
 
             print(f"\n📊 {name}:")
             print(f"   初始资金: ${self.initial_bankroll:.2f}")
@@ -197,6 +267,8 @@ class BettingStrategy:
             print(f"   最终资金: ${self.bankroll[name]:.2f}")
             print(f"   盈亏: ${profit:.2f}")
             print(f"   投资回报率: {roi:.2f}%")
+            print(f"   投注次数: {num_bets}")
+            print(f"   胜率: {win_rate:.1f}% ({wins}/{num_bets})")
 
             if self.total_bet_amount[name] > 0:
                 bet_roi = (profit / self.total_bet_amount[name]) * 100
@@ -209,7 +281,7 @@ class BettingStrategy:
 
             for name in self.all_predictors:
                 if name in df.columns:
-                    plt.plot(df.index, df[name], label=name, linewidth=2)
+                    plt.plot(df.index, df[name], label=name, linewidth=2, marker='o', markersize=4)
 
             plt.axhline(y=self.initial_bankroll, color='gray', linestyle='--', alpha=0.7, label='Initial Bankroll')
             plt.xlabel("Date", fontsize=12)
@@ -224,11 +296,12 @@ class BettingStrategy:
         # 绘制CKFM分布图
         if self.ckfm_records:
             plt.figure(figsize=(10, 6))
-            sns.histplot(self.ckfm_records, bins=30, kde=True, alpha=0.7)
+            plt.hist(self.ckfm_records, bins=30, alpha=0.7, color='blue', edgecolor='black')
             plt.axvline(x=0, color='red', linestyle='--', alpha=0.7, label='Zero CKFM')
+            plt.axvline(x=0.05, color='green', linestyle='--', alpha=0.7, label='Threshold (5%)')
             plt.xlabel("CKFM Score (Model Prob - Market Prob)", fontsize=12)
             plt.ylabel("Frequency", fontsize=12)
-            plt.title("CKFM Score Distribution for Value Bets", fontsize=14)
+            plt.title("CKFM Score Distribution for Bets", fontsize=14)
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
@@ -249,6 +322,9 @@ class BettingStrategy:
         for name in self.all_predictors:
             profit = self.bankroll[name] - self.initial_bankroll
             roi = (profit / self.initial_bankroll) * 100 if self.initial_bankroll > 0 else 0
+            num_bets = len(self.bet_records[name])
+            wins = sum(1 for bet in self.bet_records[name] if bet['won'])
+            win_rate = (wins / num_bets * 100) if num_bets > 0 else 0
 
             summary[name] = {
                 'initial_bankroll': self.initial_bankroll,
@@ -256,7 +332,9 @@ class BettingStrategy:
                 'total_bet_amount': self.total_bet_amount[name],
                 'profit': profit,
                 'roi': roi,
-                'num_bets': self.total_bet_amount[name] / self.stake_per_bet if self.stake_per_bet > 0 else 0
+                'num_bets': num_bets,
+                'wins': wins,
+                'win_rate': win_rate
             }
 
         return summary
